@@ -1,0 +1,454 @@
+---
+title: "zx4_40ov_analysis"
+author: "Yulong Liu (adopted from Seurat, SoupX,and DoubletFinder offical Vignettes)"
+date: "06/04/2021"
+output: html_notebook
+---
+
+This analysis is based on official vignettes from Seurat (https://satijalab.org/seurat/v3.1/pbmc3k_tutorial.html Compiled: October 08, 2019), Soupx (https://github.com/constantAmateur/SoupX last commit: Apr 13, 2019), and Doubletfinder (https://github.com/chris-mcginnis-ucsf/DoubletFinder last commit: Aug 9,2019). 
+
+```{r setup, include=FALSE,cache=FALSE}
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(future)
+library(SoupX)
+library(DoubletFinder)
+
+#function to search gene names 
+hFind <- function (x) {
+  zx4_40ov@assays$RNA@data@Dimnames[[1]][grep(x,zx4_40ov@assays$RNA@data@Dimnames[[1]],ignore.case = T)]
+}
+
+#function to obtain raw gene expression info
+infoRGE <- function (x) {
+#info Raw Gene Expression
+  RawExp<-FetchData(object = zx4_40ov, vars = x, slot = "counts")
+  NonZero <-apply(FetchData(object = zx4_40ov, vars = x, slot = "counts"),1, function(row) all(row !=0 ))
+  print("1.gene expression table count  2.number of expressed cells  3.average exp")
+  #expression count table
+  b <- table (RawExp[NonZero,])
+  #total number of non zero cells
+  c <- length(RawExp[NonZero,])
+  #average gene exp
+  d<- mean(RawExp[NonZero,])
+  return (list(b,c,d))
+}
+
+```
+
+
+### Setup initial seurat object
+We did initial clustering first to preliminarly identify general cell populations and for extract specific cell populations for the later ambien RNA removal steps.
+
+```{r Create_seurat, cache=TRUE}
+# Create Seurat object from raw matrix folder
+zx4_40ov.data <- Read10X(data.dir = "raw_data/filtered_feature_bc_matrix")
+
+# Create Seurat object 
+zx4_40ov <- CreateSeuratObject(counts = zx4_40ov.data, project = "zx4_40ov", min.cells = 20, min.features = 200)
+
+```
+
+
+```{r QC_check, fig.height=10, fig.width=20}
+
+# Stash % mito gene data
+zx4_40ov[["percent.mt"]] <- PercentageFeatureSet(zx4_40ov, pattern = "^mt-")
+
+# Plot gene count, transcript count, and %mito genes
+VlnPlot(zx4_40ov, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(zx4_40ov, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(zx4_40ov, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+
+# Filter cells
+zx4_40ov <- subset(zx4_40ov, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 15 & nCount_RNA < 75000)
+
+```
+
+
+```{r normalize, results='hide'}
+# Normalize the data
+zx4_40ov <- NormalizeData(object = zx4_40ov, normalization.method = "LogNormalize", scale.factor = 1e4)
+
+```
+
+
+```{r var_genes, fig.height=7, fig.width=11, results='hide'}
+# Find top 2000 variable genes
+zx4_40ov <- FindVariableFeatures(zx4_40ov, selection.method = "vst", nfeatures = 2000)
+
+# ID top 10 variable genes
+top10 <- head(VariableFeatures(zx4_40ov), 10)
+
+# Plot variable genes
+plot1 <- VariableFeaturePlot(zx4_40ov)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+
+``` 
+
+
+```{r scale_and_pca}
+# Scale data based on all genes
+all.genes <- rownames(zx4_40ov)
+zx4_40ov <- ScaleData(zx4_40ov, features = all.genes)
+
+# Use ID'd 2000 Variable genes to run PCA analysis
+zx4_40ov <- RunPCA(zx4_40ov, features = VariableFeatures(object = zx4_40ov))
+
+```
+
+
+```{r multi-heatmap, fig.height=20, fig.width=9, warning=FALSE}
+# Plot heatmaps based on PCs
+DimHeatmap(zx4_40ov, dims = 1:30, cells = 500, balanced = TRUE)
+
+```
+
+
+```{r elbow_plot, fig.height=6, fig.width=15, warning=FALSE}
+# Elbow plot and jackstraw plots are used to determine the number of PC to use
+ElbowPlot(zx4_40ov,ndims = 50)
+
+```
+
+
+```{r JackStraw, fig.height=6, fig.width=15, warning=FALSE}
+# Elbow plot and jackstraw plots are used to determine the number of PC to use
+plan("multiprocess", workers = 4)
+zx4_40ov <- JackStraw(zx4_40ov, num.replicate = 100, dims = 50)
+zx4_40ov <- ScoreJackStraw(zx4_40ov, dims = 1:50)
+JackStrawPlot(zx4_40ov, dims = 1:50)
+plan("sequential")
+
+```
+
+
+```{r cluster_and_UMAP, fig.height=5, fig.width=7}
+# Choose 30 PCs for the initial rough clustering 
+zx4_40ov <- FindNeighbors(zx4_40ov, dims = 1:30)
+zx4_40ov <- FindClusters(zx4_40ov, resolution = 0.5)
+
+# Visualize with UMAP
+zx4_40ov <- RunUMAP(zx4_40ov, dims = 1:30)
+DimPlot(zx4_40ov, reduction = "umap", pt.size = 1, label = T)
+
+```
+
+
+```{r markerplots, fig.height=20, fig.width=20,}
+# Markers for cluster identification
+FeaturePlot(object = zx4_40ov, c("ddx4","gsdf","col1a1a","cyp11a2","fli1a","nkl.2","mpx","mpeg1.1","dcn","hemgn"), cols = c("grey90", "blue"), pt.size = 0.5)
+
+```
+
+
+```{r save_file_initial}
+# Save object
+zx4_40ov_initial <- zx4_40ov
+save(zx4_40ov_initial, file = "zx4_40ov_initial.robj") 
+
+
+```
+
+
+### Clean ambient mRNA
+During dissociation, large oocytes can burst and release its mRNA into the ambient environment. We performed multiple washes to remove those RNA, however, oocyte gene contamination is still visible in our dataset. Therefore, we utilized Soupx to estimate and adjust ambient RNA contamination in our dataset.
+
+```{r clean_global_env_1}
+# Reset Environment
+rm(list = ls(all.names = TRUE))
+gc()
+
+```
+
+
+```{r load_orginal_object_initial}
+# Because the non-deterministic nature of the analysis, we will load the original file from the manuscript here. You can also load your own object that you have generated with the identical settings, which should be very similar to what we had.
+load(file = "zx4_40ov_initial_orig.robj") 
+zx4_40ov <- zx4_40ov_initial_orig
+
+```
+
+
+```{r load_10X_data_for_soupx}
+# Load both filtered and unfiltered data from 10X
+scl = load10X("./raw_data")
+
+```
+
+
+```{r estimate_ambient_contamination}
+# Calculate ambient mRNA contamination
+scl = inferNonExpressedGenes(scl)
+
+# Calculate ambient mRNA contamination
+rownames(scl$channels$Channel1$nonExpressedGenes)[seq(50)]
+
+# Graph top20 genes with highest contamination fraction
+tstGenes = rownames(scl$channels$Channel1$nonExpressedGenes)[seq(20)]
+gg = plotMarkerDistribution(scl, "Channel1", tstGenes)
+plot(gg)
+
+```
+
+
+```{r estimate_expression_cutoff}
+# Find marker genes for each cluster to identify oocytes and early germ cells
+plan("multiprocess", workers = 4)
+allmarker <- FindAllMarkers(zx4_40ov)
+plan("sequential")
+allmarker %>% group_by(cluster) %>% top_n(n = 20, wt = avg_logFC)
+
+# Plot oocytes markers(zp3) and early germ cells(ddx4)
+DimPlot(zx4_40ov, label = T)
+FeaturePlot(zx4_40ov, features = "ddx4",label = T)
+FeaturePlot(zx4_40ov, features = "zp3",label = T)
+
+# Subset to remove oocyte and germ cell from the data, so cells that are not expressing the oocyte genes are used.
+zx4_40ov_no_oo_gc <- subset(zx4_40ov, idents = c("4","15","17"), invert= T)
+
+# Save the name labels
+labs <- colnames(zx4_40ov_no_oo_gc@assays$RNA@counts)
+
+# Match the name format
+labs <- paste0("Channel1___", labs, "-1")
+
+# Select the cells to use
+toUse = matrix(colnames(scl$toc) %in% labs, nrow = 1, dimnames = list("oo", 
+    colnames(scl$toc)))
+
+# Check the number of cells to use
+sum(toUse,na.rm = TRUE)
+
+# Selected zp and zar genes based on biological knowledge that they are specifically expressed in the oocytes. Those genes are from "inferNonExpressedGenes(scl)" list. Only need a couple of candidate genes for contamination fraction determination.
+ooGenes=c("zp2.1","zp2.3","zp3a.2","zp2.5","zp2.2","zar1","zp3.2","zp3","zp2.6","zp3a.1","zp3b")
+
+# Visualize which cell population SoupX are determined to be true or false expression of these oocyte genes    
+DR <- Embeddings(zx4_40ov,"umap")
+rownames(DR) <-rownames(DR) %>% gsub("^","Channel1___",.)%>% gsub("$","-1",.)
+plotMarkerMap(scl,geneSet = ooGenes,DR)
+
+# Contamination fraction plot. Global estimate in red, lowess curve in green, and monotonically decreasing lowess fit in blue.
+scl = calculateContaminationFraction(scl, "Channel1", list(oo = ooGenes), useToEst = toUse)
+gg = plotChannelContamination(scl, "Channel1")
+plot(gg)
+
+```
+
+
+```{r adjust_expression}
+# Interpolate cell contamination based on monotonically decreasing lowess fit
+scl = interpolateCellContamination(scl, "Channel1")
+head(scl$channels$Channel1$rhos)
+
+# Adjust the counts
+scl = adjustCounts(scl)
+
+```
+
+
+```{r save_soupx_data_object}
+# Save Object
+save(scl, file = "soupx-zx4_40ov.robj")
+
+```
+
+
+```{r rename}
+# Clean up the names
+scl$atoc@Dimnames[[2]] <- scl$atoc@Dimnames[[2]]%>%gsub("^Channel1___","",.)%>%gsub("-1$","",.)
+scl$channels$Channel1$channelName <- "zx4_40ov"
+
+```
+
+
+```{r recreate_seurat_post-cutoff }
+# Remake Seurat object after removed ambient RNA
+zx4_40ov <- CreateSeuratObject(scl$atoc, project = "zx4_40ov", min.cells = 20, min.features = 200)
+
+```
+
+
+```{r QC_check_soupx, fig.height=10, fig.width=20}
+zx4_40ov[["percent.mt"]] <- PercentageFeatureSet(zx4_40ov, pattern = "^mt-")
+VlnPlot(zx4_40ov, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(zx4_40ov, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(zx4_40ov, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+
+zx4_40ov <- subset(zx4_40ov, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 20 & nCount_RNA < 75000)
+
+```
+
+
+```{r normalize_soupx, results='hide'}
+zx4_40ov <- NormalizeData(object = zx4_40ov, normalization.method = "LogNormalize", scale.factor = 1e4)
+
+```
+
+
+```{r var_genes_soupx, fig.height=7, fig.width=11, results='hide'}
+zx4_40ov <- FindVariableFeatures(zx4_40ov, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(zx4_40ov), 10)
+
+plot1 <- VariableFeaturePlot(zx4_40ov)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+
+``` 
+
+
+```{r scale_and_pca_soupx}
+all.genes <- rownames(zx4_40ov)
+zx4_40ov <- ScaleData(zx4_40ov, features = all.genes)
+
+zx4_40ov <- RunPCA(zx4_40ov, features = VariableFeatures(object = zx4_40ov))
+
+```
+
+
+```{r multi-heatmap_soupx, fig.height=20, fig.width=9, warning=FALSE}
+DimHeatmap(zx4_40ov, dims = 1:30, cells = 500, balanced = TRUE)
+
+```
+
+
+```{r elbow_plot_soupx, fig.height=6, fig.width=15, warning=FALSE}
+ElbowPlot(zx4_40ov,ndims = 50)
+
+```
+
+
+```{r cluster_and_UMAP_soupx, fig.height=5, fig.width=7}
+zx4_40ov <- FindNeighbors(zx4_40ov, dims = 1:30)
+zx4_40ov <- FindClusters(zx4_40ov, resolution = 0.5)
+zx4_40ov <- RunUMAP(zx4_40ov, dims = 1:30)
+
+DimPlot(zx4_40ov, reduction = "umap", pt.size = 1, label = T)
+FeaturePlot(zx4_40ov,"zp3")
+
+```
+
+
+```{r save_object_after_soupx_ambient_RNA_removal}
+zx4_40ov_soupx <- zx4_40ov
+save(zx4_40ov_soupx, file = "zx4_40ov_soupx.robj")
+
+```
+
+
+### Removing doublets
+A small percentage of doublet formation is expected during scRNAseq. These doublets can form when there is incomplete separation during dissociation process or a single droplet can co-capture multiple cells during library preparation. Here we use DoubletFinder to identify doublets in the dataset and remove them.  
+
+```{r clean_global_env}
+rm(list = ls(all.names = TRUE))
+gc()
+
+```
+
+
+```{r load_original_object_soupx}
+# Because the non-deterministic nature of the analysis, we will load the original file from the manuscript here. You can also load your own object that you have generated with the identical settings, which should be very similar to what we had.
+load(file = "zx4_40ov_soupx_orig.robj")
+zx4_40ov <- zx4_40ov_soupx_orig
+
+```
+
+
+```{r remove_gc_oo_bl}
+# Remove germ cells, oocytes, and blood cells. The dissociation protocol for the somatic cell libraries are not optimized for germ cells, so we decided to remove all germ cells from those libraries and only use the germ cell-specific library for our final analyses.
+
+# Find marker genes for each cluster to identify germ cell, oocyte, and blood cell clusters.
+plan("multiprocess", workers = 4)
+allmarker <- FindAllMarkers(zx4_40ov)
+plan("sequential")
+allmarker %>% group_by(cluster) %>% top_n(n = 20, wt = avg_logFC)
+
+# Plot oocytes(zp3) and early germ cells(ddx4), and blood cells(hbba1)
+DimPlot(zx4_40ov, label = T)
+FeaturePlot(zx4_40ov, features = "ddx4",label = T)
+FeaturePlot(zx4_40ov, features = "zp3",label = T)
+FeaturePlot(zx4_40ov, features = "hbba1",label = T)
+
+# Combine the gene expression and marker genes expression pattern to identify germ cell, oocyte, and blood cell clusters.
+zx4_40ov <- subset(zx4_40ov,idents = c("12", "3", "6","2","16"), invert=T)
+
+```
+
+
+```{r pK_identification(no ground-truth), message=FALSE, warning=FALSE}
+# Statistically identify pK value to use
+sweep.res.list.st <- paramSweep_v3(zx4_40ov, PCs = 1:30, sct = F)
+sweep.stats.st <- summarizeSweep(sweep.res.list.st, GT = FALSE)
+bcmvn.st<- find.pK(sweep.stats.st)
+
+```
+
+
+```{r Homotypic_doublet_proportion_estimate }
+# Conservatively assuming 5% doublet formation rate to estimate homotypic doublet proportion 
+annotation <- zx4_40ov@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotation)           
+nExp_poi <- round(0.05*length(zx4_40ov@active.ident))  
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+```
+
+
+```{r remove_doublets_message=FALSE, warning=FALSE}
+# Identify doublets. PCs based on previous clustering, pN used default (have minimal effect), and pK based on paramSweep_v3. 
+df <- doubletFinder_v3(zx4_40ov, PCs = 1:30, pN = 0.25, pK = 0.005, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = F)
+pull_id <- as.matrix(df@active.ident)
+calss_id <- data.frame(row.names = rownames(pull_id), "SorD" =df@meta.data$DF.classifications_0.25_0.005_328 )
+id_singlet <- as.vector(rownames (subset(calss_id, SorD== "Singlet")))
+
+# Visualize singlets compares to all data 
+DimPlot(df, cells = id_singlet)
+DimPlot(df)
+zx4_40ov_clean <- subset(df, cells = id_singlet)
+
+# Compare before and after doublet removal. Note, the goal of this step is to further improve the data set by remove a substantial portion of the potential doubles, but it is not trying to make the data doublets free. 
+FeaturePlot(zx4_40ov_clean, features = "gsdf")
+FeaturePlot(df, features = "gsdf")
+
+```
+
+
+```{r sc_transform_test}
+# Test clustering used SCTransform. This library will be combined with another somatic library for final analysis. We decided to use SCTransform as our final analysis normalization method based on Hafemeister et al., 2019 on bioRxive. This method uses regularized negative binomial regression to normalize the data, which demonstrated to improve the removal of molecular count influence. 
+zx4_40ov <- zx4_40ov_clean
+zx4_40ov <- SCTransform(object = zx4_40ov, verbose = F)
+zx4_40ov <- RunPCA(zx4_40ov, features = VariableFeatures(object = zx4_40ov))
+ElbowPlot(zx4_40ov, ndims = 50)
+zx4_40ov <- FindNeighbors(zx4_40ov, dims = 1:30)
+zx4_40ov <- FindClusters(zx4_40ov, resolution = 0.5)
+zx4_40ov <- RunUMAP(zx4_40ov, dims = 1:30)
+DimPlot(zx4_40ov)
+
+```
+
+
+```{r markerplots_sc_transform, fig.height=20, fig.width=20,}
+# Markers for cluster identification
+FeaturePlot(object = zx4_40ov_clean, c("col1a1a", "cyp17a1", "fli1a", "lyz", "lck","mpeg1.1","gsdf", "lhx9","gpc1a","cx34.5","pcna","cxcl12a", "scara3","fgf24","en1b","tbx2b"), cols = c("grey90", "blue"), pt.size = 0.5)
+
+```
+
+
+```{r save_object_after_doublet_removal}
+save(zx4_40ov_clean, file = "zx4_40ov_clean.robj")
+
+```
+
+
+```{r session_info}
+sessionInfo()
+
+```
+

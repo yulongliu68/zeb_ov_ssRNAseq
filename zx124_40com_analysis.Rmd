@@ -1,0 +1,135 @@
+---
+title: "zx124_40com_analysis"
+author: "Yulong Liu (adopted from Seurat offical Vignettes)"
+date: "0/30/2019"
+output: html_notebook
+---
+
+This analysis is based on official vignettes from Seurat (https://satijalab.org/seurat/v3.1/pbmc3k_tutorial.html Compiled: October 08, 2019). 
+
+```{r setup, include=FALSE,cache=FALSE}
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(future)
+
+# Function to search gene names 
+hFind <- function (x) {
+  zx124_40com@assays$RNA@data@Dimnames[[1]][grep(x,zx124_40com@assays$RNA@data@Dimnames[[1]],ignore.case = T)]
+}
+
+# Function to obtain raw gene expression info
+infoRGE <- function (x) {
+# Info Raw Gene Expression
+  RawExp<-FetchData(object = zx124_40com, vars = x, slot = "counts")
+  NonZero <-apply(FetchData(object = zx124_40com, vars = x, slot = "counts"),1, function(row) all(row !=0 ))
+  print("1.gene expression table count  2.number of expressed cells  3.average exp")
+  # Epression count table
+  b <- table (RawExp[NonZero,])
+  # Total number of non zero cells
+  c <- length(RawExp[NonZero,])
+  # Average gene exp
+  d<- mean(RawExp[NonZero,])
+  return (list(b,c,d))
+}
+
+```
+
+
+### Combine germ cell and somatic cell libraries
+```{r, cache=TRUE}
+load(file = "zx1_40gc_final_orig.robj")
+load(file = "zx24_40ov_final_orig.robj")
+
+zx124_40com <- merge(x=zx24_40ov_final_orig,y=zx1_40gc_final_orig)
+unique(zx124_40com@meta.data$orig.ident)
+rm(zx24_40ov_final_orig)
+rm(zx1_40gc_final_orig)
+```
+
+
+```{r sctransform, warning=FALSE}
+# We decided to use SCTransform as our final analysis normalization method based on Hafemeister et al., 2019 on bioRxive. This method uses regularized negative binomial regression to normalize the data, which demonstrated to improve the removal of molecular count influence.
+zx124_40com <- SCTransform(zx124_40com,  verbose = FALSE)
+
+```
+
+
+```{r pca_and_heatmap, fig.height=20,fig.width=10}
+# Use variable genes to find PCs
+zx124_40com <- RunPCA(zx124_40com, features = VariableFeatures(object = zx124_40com))
+
+# Plot heatmaps based on PCs
+DimHeatmap(zx124_40com, dims = 1:20, cells = 500, balanced = TRUE)
+
+```
+
+
+```{r elbow_plot, fig.height=6, fig.width=15, warning=FALSE}
+# Elbow plot and jackstraw plots are used to determine the number of PC to use
+ElbowPlot(zx124_40com,ndims = 50)
+
+```
+
+```{r JackStraw, fig.height=6, fig.width=15, warning=FALSE}
+# Elbow plot and jackstraw plots are used to determine the number of PC to use
+plan("multiprocess", workers = 4)
+zx124_40com <- JackStraw(zx124_40com, num.replicate = 100,dims = 50)
+zx124_40com <- ScoreJackStraw(zx124_40com, dims = 1:50)
+JackStrawPlot(zx124_40com, dims = 1:50)
+plan("sequential")
+
+```
+
+
+```{r cluster_and_UMAP, fig.height=10, fig.width=15}
+# Due to the complex nature of data including multiple cell types, we tested a spectrum of the PCs for both clustering and UMAP. Take elbow plot, Jack Straw plot, and biological knowledge into consideration when choosing the PC numbers.
+zx124_40com <- FindNeighbors(zx124_40com, dims = c(1:10,13,14,15,17,18,19,20,21,22))
+zx124_40com <- FindClusters(zx124_40com, resolution = 0.5)
+zx124_40com <- RunUMAP(zx124_40com, dims = c(1:10,13,14,15,17,18,19,20,21,22), min.dist = 0.3)
+DimPlot(zx124_40com, label = T, pt.size = 1.2,label.size = 10)
+
+zx124_40com <- FindNeighbors(zx124_40com, dims = 1:10)
+zx124_40com <- FindClusters(zx124_40com, resolution = 0.5)
+zx124_40com <- RunUMAP(zx124_40com, dims = 1:10, min.dist = 0.3)
+DimPlot(zx124_40com, label = T, pt.size = 1.2,label.size = 10)
+
+zx124_40com <- FindNeighbors(zx124_40com, dims = 1:22)
+zx124_40com <- FindClusters(zx124_40com, resolution = 0.5)
+zx124_40com <- RunUMAP(zx124_40com, dims = 1:22, min.dist = 0.3)
+DimPlot(zx124_40com, label = T, pt.size = 1.2,label.size = 10)
+
+zx124_40com <- FindNeighbors(zx124_40com, dims = 1:30)
+zx124_40com <- FindClusters(zx124_40com, resolution = 0.5)
+zx124_40com <- RunUMAP(zx124_40com, dims = 1:30, min.dist = 0.3)
+DimPlot(zx124_40com, label = T, pt.size = 1.2,label.size = 10)
+
+# We choose 22 PCs for our final analysis based on the consistant drop of p-values at 22 PCs in the Jack Straw plot, and it's at the end of the "elbow"" in the elbow plot. The UMAP also made most sense to us based on biological knowledge. 
+zx124_40com <- FindNeighbors(zx124_40com, dims = 1:22)
+zx124_40com <- FindClusters(zx124_40com, resolution = 0.5)
+zx124_40com <- RunUMAP(zx124_40com, dims = 1:22, min.dist = 0.3)
+DimPlot(zx124_40com, label = T, pt.size = 1.2,label.size = 10)
+DimPlot(zx124_40com, group.by = "orig.ident")
+
+```
+
+
+```{r markerplots, fig.height=20, fig.width=20,}
+# Cell type identification
+FeaturePlot(object = zx124_40com, c("nanos2","zgc:194189","rec8a","dmc1","zp3","col1a1", "cyp17a1", "fli1a", "lyz", "lck","mpeg1.1","gsdf", "lhx9","gpc1a","cx34.5","pcna","cxcl12a", "scara3","fgf24","en1b","tbx2b"), cols = c("grey90", "blue"), pt.size = 0.5)
+
+```
+
+
+```{r save_file_final}
+# Save final object
+zx124_40com_final <- zx124_40com
+save(zx124_40com_final, file = "zx124_40com_final.robj") 
+
+```
+
+
+```{r session_info}
+sessionInfo()
+
+```
